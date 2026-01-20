@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Expense Tracker - Frontend</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/modern-normalize/modern-normalize.css" rel="stylesheet">
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 16px; max-width: 960px; margin: auto; }
+    header { display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;}
+    h1 { margin: 0; font-size: 1.4rem; }
+    .card { border: 1px solid #eee; padding: 12px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.03); }
+    form { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, select { padding:8px; border-radius:6px; border:1px solid #ddd; min-width:120px; }
+    button { padding:8px 12px; border-radius:6px; border: none; background:#2563eb; color:white; cursor:pointer; }
+    button[disabled] { opacity:0.6; cursor:not-allowed; }
+    table { width:100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { padding:8px; border-bottom: 1px solid #eee; text-align:left; }
+    .small { font-size:0.9rem; color:#666; }
+    #chartWrap { width: 100%; max-width: 600px; margin-top: 12px; }
+    .status { font-weight:600; }
+    .controls { display:flex; gap:8px; align-items:center; }
+    #apiInput { width:260px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Expense Tracker</h1>
+    <div class="small">Backend API: <span id="apiUrl">http://127.0.0.1:5000</span></div>
+  </header>
+
+  <div class="card">
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+      <label class="small">API base</label>
+      <input id="apiInput" value="http://127.0.0.1:5000" />
+      <button id="setApiBtn">Set</button>
+      <div class="small" style="margin-left:auto;">Status: <span id="connectStatus" class="small">unknown</span></div>
+    </div>
+
+    <form id="addForm" novalidate>
+      <input id="date" placeholder="YYYY-MM-DD" pattern="\d{4}-\d{2}-\d{2}" title="YYYY-MM-DD" required />
+      <input id="amount" placeholder="Amount" type="number" step="0.01" required />
+      <input id="category" placeholder="Category" />
+      <input id="note" placeholder="Note" />
+      <button type="submit">Add</button>
+    </form>
+    <div id="msg" class="small" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <strong>Expenses</strong>
+      <div class="controls">
+        <button id="refreshBtn">Refresh</button>
+        <button id="exportBtn">Export to Excel (delayed)</button>
+        <input id="exportDelay" type="number" min="0" value="20" style="width:80px;" title="Delay seconds" />
+      </div>
+    </div>
+    <table id="expensesTable" aria-live="polite">
+      <thead><tr><th>ID</th><th>Date</th><th>Amount</th><th>Category</th><th>Note</th></tr></thead>
+      <tbody></tbody>
+    </table>
+
+    <div id="exportArea" style="margin-top:10px">
+      <div class="small">Export status: <span id="exportStatus">idle</span></div>
+      <div id="downloadLink" style="margin-top:6px"></div>
+    </div>
+
+    <div id="chartWrap">
+      <canvas id="pieChart" width="400" height="400" aria-label="Expenses by category chart" role="img"></canvas>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    // ---- Config & DOM ----
+    let API_BASE = document.getElementById('apiInput').value.trim() || "http://127.0.0.1:5000";
+    const apiUrlEl = document.getElementById('apiUrl');
+    const tableBody = document.querySelector("#expensesTable tbody");
+    const msg = document.getElementById('msg');
+    const exportStatusEl = document.getElementById('exportStatus');
+    const downloadLinkDiv = document.getElementById('downloadLink');
+    const connectStatus = document.getElementById('connectStatus');
+    const exportBtn = document.getElementById('exportBtn');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const setApiBtn = document.getElementById('setApiBtn');
+    const apiInput = document.getElementById('apiInput');
+    const exportDelayInput = document.getElementById('exportDelay');
+
+    let exportPollInterval = null;
+    let chart = null;
+    let lastFetched = null;
+
+    function updateApiDisplay() {
+      apiUrlEl.textContent = API_BASE;
+    }
+    updateApiDisplay();
+
+    // ---- Utilities ----
+    function showMsg(text, isError = false) {
+      msg.textContent = text;
+      msg.style.color = isError ? "crimson" : "";
+    }
+
+    async function safeFetch(path, opts = {}) {
+      const url = API_BASE.replace(/\/$/, '') + path;
+      // Add a short timeout to avoid indefinite hanging
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), 15000);
+      try {
+        const res = await fetch(url, {...opts, signal: controller.signal});
+        clearTimeout(id);
+        if (!res.ok) {
+          // try to parse body for error
+          let text;
+          try { text = await res.text(); } catch(e) { text = res.statusText; }
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+        const ct = res.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          return await res.json();
+        } else {
+          // if not json, return raw text
+          return {raw: await res.text()};
+        }
+      } catch (err) {
+        clearTimeout(id);
+        throw err;
+      }
+    }
+
+    // ---- Expenses / UI ----
+    async function fetchExpenses(showErrors = true) {
+      try {
+        const j = await safeFetch("/api/expenses");
+        if (j && j.success && Array.isArray(j.expenses)) {
+          renderTable(j.expenses);
+          renderChart(j.expenses);
+          connectStatus.textContent = "connected";
+          connectStatus.style.color = "green";
+          lastFetched = new Date();
+        } else {
+          renderTable([]);
+          renderChart([]);
+          connectStatus.textContent = "no-data";
+          connectStatus.style.color = "orange";
+          if (showErrors) showMsg("Server responded but no expenses: " + (j && j.error ? j.error : "unexpected format"), true);
+        }
+      } catch (e) {
+        renderTable([]);
+        renderChart([]);
+        connectStatus.textContent = "unreachable";
+        connectStatus.style.color = "crimson";
+        if (showErrors) showMsg("API unreachable: " + e.message, true);
+      }
+    }
+
+    function renderTable(items) {
+      tableBody.innerHTML = "";
+      items.forEach(it => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${escapeHtml(it.id)}</td><td>${escapeHtml(it.date)}</td><td>${escapeHtml(it.amount)}</td><td>${escapeHtml(it.category || '')}</td><td>${escapeHtml(it.note || '')}</td>`;
+        tableBody.appendChild(tr);
+      });
+      if (items.length === 0) {
+        tableBody.innerHTML = '<tr><td colspan="5" class="small">No expenses found.</td></tr>';
+      }
+    }
+
+    function renderChart(items) {
+      const byCat = {};
+      items.forEach(it => {
+        const c = (it.category && it.category.trim()) ? it.category.trim() : "Uncategorized";
+        byCat[c] = (byCat[c] || 0) + Number(it.amount || 0);
+      });
+      const labels = Object.keys(byCat);
+      const data = Object.values(byCat);
+      if (!chart) {
+        const ctx = document.getElementById('pieChart').getContext('2d');
+        chart = new Chart(ctx, {
+          type: 'pie',
+          data: { labels, datasets: [{ data }] },
+          options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+        });
+      } else {
+        chart.data.labels = labels;
+        chart.data.datasets[0].data = data;
+        chart.update();
+      }
+    }
+
+    function escapeHtml(s) {
+      if (s === null || s === undefined) return "";
+      return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    }
+
+    // ---- Add expense ----
+    document.getElementById('addForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const date = document.getElementById('date').value.trim();
+      const amount = document.getElementById('amount').value.trim();
+      const category = document.getElementById('category').value.trim();
+      const note = document.getElementById('note').value.trim();
+
+      // Basic validation
+      if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        showMsg("Please enter a date in YYYY-MM-DD format.", true);
+        return;
+      }
+      if (!amount || isNaN(Number(amount))) {
+        showMsg("Please enter a valid amount.", true);
+        return;
+      }
+
+      const payload = { date, amount: Number(amount), category, note };
+
+      try {
+        const j = await safeFetch("/api/expenses", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (j && j.success) {
+          showMsg("Added expense (id " + (j.id ?? "?") + ")");
+          e.target.reset();
+          fetchExpenses();
+        } else {
+          showMsg("Add error: " + (j && j.error ? j.error : "unknown"), true);
+        }
+      } catch (err) {
+        showMsg("API error: " + err.message, true);
+      }
+    });
+
+    // ---- Refresh & API base set ----
+    refreshBtn.addEventListener('click', () => fetchExpenses());
+    setApiBtn.addEventListener('click', () => {
+      const v = apiInput.value.trim();
+      if (!v) { showMsg("API base cannot be empty", true); return; }
+      API_BASE = v;
+      updateApiDisplay();
+      showMsg("API base set to " + API_BASE);
+      fetchExpenses();
+    });
+
+    // ---- Export flow ----
+    exportBtn.addEventListener('click', async () => {
+      const delay = Math.max(0, Number(exportDelayInput.value) || 0);
+      exportBtn.disabled = true;
+      exportStatusEl.textContent = "scheduling...";
+      downloadLinkDiv.innerHTML = "";
+      try {
+        const j = await safeFetch("/api/export/start", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ delay_seconds: delay })
+        });
+        if (j && j.success) {
+          exportStatusEl.textContent = `scheduled (will start in ${delay}s)`;
+          pollExportStatus();
+        } else {
+          exportStatusEl.textContent = "error starting export";
+          showMsg("Export start error: " + (j && j.error ? j.error : "unknown"), true);
+          exportBtn.disabled = false;
+        }
+      } catch (e) {
+        exportStatusEl.textContent = "network error";
+        showMsg("Export network error: " + e.message, true);
+        exportBtn.disabled = false;
+      }
+    });
+
+    async function pollExportStatus() {
+      // clear any previous poll
+      if (exportPollInterval) clearInterval(exportPollInterval);
+      exportPollInterval = setInterval(async () => {
+        try {
+          const j = await safeFetch("/api/export/status");
+          const s = j && j.status ? j.status : {};
+          // Normalize structure
+          if (s.running) {
+            exportStatusEl.textContent = "running (started " + (s.started_at || "") + ")";
+            downloadLinkDiv.innerHTML = "";
+            exportBtn.disabled = true;
+          } else if (s.finished_at && s.path) {
+            exportStatusEl.textContent = "finished (" + s.finished_at + ")";
+            downloadLinkDiv.innerHTML = `<a href="${API_BASE.replace(/\/$/,'')}/api/export/download" target="_blank" rel="noopener">Download XLSX</a> — server path: ${escapeHtml(s.path)}`;
+            clearInterval(exportPollInterval);
+            exportPollInterval = null;
+            exportBtn.disabled = false;
+          } else if (s.last_error) {
+            exportStatusEl.textContent = "error: " + s.last_error;
+            clearInterval(exportPollInterval);
+            exportPollInterval = null;
+            exportBtn.disabled = false;
+            showMsg("Export failed: " + s.last_error, true);
+          } else {
+            exportStatusEl.textContent = "idle";
+            // Keep polling until finished or error
+          }
+        } catch (e) {
+          exportStatusEl.textContent = "poll error";
+          clearInterval(exportPollInterval);
+          exportPollInterval = null;
+          exportBtn.disabled = false;
+          showMsg("Export poll error: " + e.message, true);
+        }
+      }, 2000);
+    }
+
+    // ---- initial load ----
+    fetchExpenses();
+
+    // ---- small helper: refresh every 5 min in background (optional) ----
+    // setInterval(fetchExpenses, 5 * 60 * 1000);
+
+  </script>
+</body>
+</html>
